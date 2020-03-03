@@ -1,15 +1,15 @@
 use std::env;
+use std::io::ErrorKind;
 use std::time::Duration;
 
-use async_std::io::{copy, ReadExt};
+use async_std::io::{BufReader, BufWriter, ReadExt};
 use async_std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use async_std::prelude::*;
 use async_std::task;
-use futures::future::try_join;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use once_cell::sync::OnceCell;
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use sagittarius::DEFAULT_SERVER_ADDR;
 
 static PORT: OnceCell<u16> = OnceCell::new();
@@ -39,7 +39,8 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<(), anyhow::Error> {
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
-                debug!("accept request from {:?}", addr);
+                trace!("accept request from {}", addr);
+                socket.set_nodelay(true)?;
 
                 task::spawn(async move {
                     let mut session = Session {
@@ -75,13 +76,13 @@ struct Session {
 }
 
 const METHOD_SELECTION_RESP: [u8; 2] = [0x05, 0x00];
-const SOCKS_RESP_PREFIX: [u8; 8] = [0x05, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01];
+const SOCKS_RESP_PREFIX: [u8; 4] = [0x05, 0x00, 0x00, 0x01];
 
 impl Session {
     async fn run(&mut self) -> Result<(), anyhow::Error> {
         self.method_selection().await?;
         self.socks().await?;
-        self.pipe_remote().await?;
+        self.relay().await?;
         Ok(())
     }
 
@@ -96,7 +97,6 @@ impl Session {
 
         self.inbound.read_exact(&mut self.buf).await?;
         self.inbound.write_all(&METHOD_SELECTION_RESP).await?;
-        self.inbound.flush().await?;
         Ok(())
     }
 
@@ -104,10 +104,24 @@ impl Session {
         let mut buf = [0 as u8; 4];
         self.inbound.read_exact(&mut buf).await?;
 
-        validate_socks_request(&buf)?;
+        validate_version(&buf)?;
+
+        if buf[1] != 0x01 {
+            self.inbound
+                .write_all(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                .await?;
+            return Err(anyhow!("unsupported CMD {:#04x}", buf[1]));
+        }
+
+        if buf[2] != 0x0 {
+            return Err(anyhow!("wrong RSV {:#04x}", buf[2]));
+        }
 
         match buf[3] {
             0x01 => {
+                self.inbound
+                    .write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await?;
                 return Err(anyhow!("address type IPV4 not supported"));
             }
             0x03 => {
@@ -121,48 +135,98 @@ impl Session {
 
                 self.inbound.read_exact(&mut self.port).await?;
 
-                debug!(
+                trace!(
                     "accept request to {}:{}",
                     self.normalized_host(),
                     self.normalized_port()
                 );
             }
             0x04 => {
+                self.inbound
+                    .write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await?;
                 return Err(anyhow!("address type IPV6 not supported"));
             }
 
-            _ => return Err(anyhow!("unknown address type {:#04x}", buf[3])),
-        }
-
-        let mut resp = Vec::from(SOCKS_RESP_PREFIX.as_ref());
-        resp.extend_from_slice(PORT.get().unwrap().to_be_bytes().as_ref());
-        self.inbound.write_all(&resp).await?;
-        self.inbound.flush().await?;
+            _ => {
+                self.inbound
+                    .write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await?;
+                return Err(anyhow!("unknown address type {:#04x}", buf[3]));
+            }
+        };
 
         Ok(())
     }
 
-    async fn pipe_remote(&mut self) -> Result<(), anyhow::Error> {
-        let remote = TcpStream::connect(REMOTE.get().unwrap()).await?;
+    async fn relay(&mut self) -> Result<(), anyhow::Error> {
+        let remote = match TcpStream::connect(REMOTE.get().unwrap()).await {
+            Ok(remote) => {
+                let mut resp = Vec::from(SOCKS_RESP_PREFIX.as_ref());
+                if let SocketAddr::V4(addr) = remote.local_addr().as_ref().unwrap() {
+                    resp.extend_from_slice(&addr.ip().octets());
+                    resp.extend_from_slice(&addr.port().to_be_bytes());
+                    self.inbound.write_all(&resp).await?;
+                }
+                remote
+            }
+            Err(e) => {
+                let err_type = match e.kind() {
+                    ErrorKind::ConnectionRefused => 0x05,
+                    ErrorKind::ConnectionAborted => 0x04,
+                    _ => 0x03,
+                };
+                self.inbound
+                    .write_all(&[
+                        0x05, err_type, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    ])
+                    .await?;
+                return Err(anyhow!(
+                    "error connect to server {}. err: {:?}",
+                    REMOTE.get().unwrap(),
+                    e
+                ));
+            }
+        };
+
+        remote.set_nodelay(true)?;
         self.outbound = Some(remote);
 
         let size = self.host.len() as u8;
-        let size_hex = size.to_be_bytes();
-        self.outbound_mut().write_all(&size_hex).await?;
+        self.outbound_mut().write_all(&size.to_be_bytes()).await?;
 
         let mut header = self.host.clone();
         header.extend_from_slice(&self.port);
-        debug!("size: {}, header: {:?}", size, &header);
+        trace!("size: {}, header: {:?}", size, &header);
         self.outbound_mut().write_all(&header).await?;
-        self.outbound_mut().flush().await?;
 
         let addr = format!("{}:{}", self.normalized_host(), self.normalized_port());
-        let f = || format!("address: {}", addr);
-        let mut ri = self.inbound.clone();
-        let mut ro = self.outbound.as_ref().unwrap().clone();
-        let i2o = copy(&mut ri, self.outbound.as_mut().unwrap());
-        let o2i = copy(&mut ro, &mut self.inbound);
-        try_join(i2o, o2i).await.with_context(&f)?;
+        let mut ri = BufReader::with_capacity(2048, self.inbound.clone());
+        let mut wi = BufWriter::with_capacity(2048, self.inbound.clone());
+        let mut ro = BufReader::with_capacity(2048, self.outbound.as_ref().unwrap().clone());
+        let mut wo = BufWriter::with_capacity(2048, self.outbound.as_ref().unwrap().clone());
+
+        use async_std::io::copy;
+        let i2o = copy(&mut ri, &mut wo);
+        let o2i = copy(&mut ro, &mut wi);
+
+        debug!(
+            "relay {} <-> {} established",
+            self.outbound_local_addr(),
+            &addr
+        );
+
+        match i2o.race(o2i).await {
+            Ok(c) => debug!(
+                "relay {} <-> {} copied {} bytes",
+                self.outbound_local_addr(),
+                &addr,
+                c
+            ),
+            Err(e) => {
+                error!("relay {} <-> {} error {:?}", self.peer_addr, &addr, e);
+            }
+        }
 
         Ok(())
     }
@@ -178,24 +242,15 @@ impl Session {
     fn outbound_mut(&mut self) -> &mut TcpStream {
         self.outbound.as_mut().unwrap()
     }
+
+    fn outbound_local_addr(&self) -> SocketAddr {
+        self.outbound.as_ref().unwrap().local_addr().unwrap()
+    }
 }
 
 fn validate_version(buf: &[u8]) -> Result<(), anyhow::Error> {
     if buf[0] != 0x05 {
         return Err(anyhow!("unknown version {}", buf[0]));
-    }
-
-    Ok(())
-}
-
-fn validate_socks_request(buf: &[u8]) -> Result<(), anyhow::Error> {
-    validate_version(buf)?;
-
-    if buf[1] != 0x01 {
-        return Err(anyhow!("unsupported CMD {:#04x}", buf[1]));
-    }
-    if buf[2] != 0x0 {
-        return Err(anyhow!("wrong RSV {:#04x}", buf[2]));
     }
 
     Ok(())

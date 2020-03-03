@@ -2,7 +2,7 @@ use std::env;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use async_std::io::{BufReader, BufWriter, ReadExt};
+use async_std::io::{BufReader, ReadExt};
 use async_std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use async_std::prelude::*;
 use async_std::task;
@@ -201,10 +201,10 @@ impl Session {
         self.outbound_mut().write_all(&header).await?;
 
         let addr = format!("{}:{}", self.normalized_host(), self.normalized_port());
-        let mut ri = BufReader::with_capacity(2048, self.inbound.clone());
-        let mut wi = BufWriter::with_capacity(2048, self.inbound.clone());
-        let mut ro = BufReader::with_capacity(2048, self.outbound.as_ref().unwrap().clone());
-        let mut wo = BufWriter::with_capacity(2048, self.outbound.as_ref().unwrap().clone());
+        let mut ri = BufReader::new(self.inbound.clone());
+        let mut wi = self.inbound.clone();
+        let mut ro = BufReader::new(self.outbound.as_ref().unwrap().clone());
+        let mut wo = self.outbound.as_ref().unwrap().clone();
 
         use async_std::io::copy;
         let i2o = copy(&mut ri, &mut wo);

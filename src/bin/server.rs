@@ -160,7 +160,7 @@ impl Session {
 
         match future::select(i2o, o2i).await {
             Either::Left((Ok(n), _)) => debug!(
-                "RELAY {}({}b) -> {}({}) closed",
+                "RELAY {}({} bytes) -> {}({}) closed",
                 self.peer_addr,
                 n,
                 self.target_addr(),
@@ -186,7 +186,7 @@ impl Session {
                 }
             }
             Either::Right((Ok(n), _)) => debug!(
-                "RELAY {} <- {}({})({}b) closed",
+                "RELAY {} <- {}({})({} bytes) closed",
                 self.peer_addr,
                 self.target_addr(),
                 remote_ip,

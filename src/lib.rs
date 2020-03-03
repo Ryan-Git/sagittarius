@@ -6,7 +6,7 @@ use env_logger::Env;
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:18888";
 
 pub fn init_log() {
-    const DEFAULT_LOG_LEVEL: &str = "debug";
+    const DEFAULT_LOG_LEVEL: &str = "info";
 
     env_logger::from_env(Env::default().default_filter_or(DEFAULT_LOG_LEVEL))
         .format(|buf, record| {

@@ -2,8 +2,6 @@ use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
 
-use futures::future;
-use futures::future::Either;
 use log::{debug, error, info, trace};
 use lru::LruCache;
 use once_cell::sync::Lazy;
@@ -14,8 +12,8 @@ use tokio::net::{lookup_host, TcpListener, TcpStream, ToSocketAddrs};
 use tokio::time::{delay_for, Duration};
 
 use anyhow::anyhow;
-use sagittarius::DEFAULT_SERVER_ADDR;
-use std::io::ErrorKind;
+use sagittarius::{Channel, Relay, DEFAULT_SERVER_ADDR};
+use tokio::net::tcp::{ReadHalf, WriteHalf};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -76,8 +74,7 @@ static UNIFORM: Lazy<Uniform<u64>> = Lazy::new(|| Uniform::new(100, 5000));
 impl Session {
     async fn run(&mut self) -> Result<(), anyhow::Error> {
         self.read_address().await?;
-        self.relay().await?;
-        Ok(())
+        self.relay().await
     }
 
     async fn read_address(&mut self) -> Result<(), anyhow::Error> {
@@ -91,15 +88,7 @@ impl Session {
         let host = String::from_utf8(buf)?;
         let port = self.inbound.read_u16().await?;
         self.target_addr = Some(format!("{}:{}", host, port));
-        trace!(
-            "request to {} from {}",
-            self.target_addr.as_ref().unwrap(),
-            self.peer_addr
-        );
-        Ok(())
-    }
 
-    async fn relay(&mut self) -> Result<(), anyhow::Error> {
         let remote_ip = match self.addr_cache.get(self.target_addr.as_ref().unwrap()) {
             Some(addr) => addr.clone(),
             None => match lookup_host(self.target_addr()).await {
@@ -150,76 +139,22 @@ impl Session {
             self.target_addr(),
             remote_ip
         );
-
-        let (mut ri, mut wi) = self.inbound.split();
-        let (mut ro, mut wo) = self.outbound.as_mut().unwrap().split();
-
-        use tokio::io::copy;
-        let i2o = copy(&mut ri, &mut wo);
-        let o2i = copy(&mut ro, &mut wi);
-
-        match future::select(i2o, o2i).await {
-            Either::Left((Ok(n), _)) => debug!(
-                "RELAY {}({} bytes) -> {}({}) closed",
-                self.peer_addr,
-                n,
-                self.target_addr(),
-                remote_ip
-            ),
-            Either::Left((Err(err), _)) => {
-                if let ErrorKind::TimedOut = err.kind() {
-                    debug!(
-                        "RELAY {} -> {}({}) closed with error {:?}",
-                        self.peer_addr,
-                        self.target_addr(),
-                        remote_ip,
-                        err
-                    );
-                } else {
-                    error!(
-                        "RELAY {} -> {}({}) closed with error {:?}",
-                        self.peer_addr,
-                        self.target_addr(),
-                        remote_ip,
-                        err
-                    );
-                }
-            }
-            Either::Right((Ok(n), _)) => debug!(
-                "RELAY {} <- {}({})({} bytes) closed",
-                self.peer_addr,
-                self.target_addr(),
-                remote_ip,
-                n
-            ),
-            Either::Right((Err(err), _)) => {
-                if let ErrorKind::TimedOut = err.kind() {
-                    debug!(
-                        "RELAY {} <- {}({}) closed with error {}",
-                        self.peer_addr,
-                        self.target_addr(),
-                        remote_ip,
-                        err
-                    );
-                } else {
-                    error!(
-                        "RELAY {} <- {}({}) closed with error {}",
-                        self.peer_addr,
-                        self.target_addr(),
-                        remote_ip,
-                        err
-                    );
-                }
-            }
-        }
-
-        trace!(
-            "RELAY {} <-> {}({}) closing",
-            self.peer_addr,
-            self.target_addr(),
-            remote_ip
-        );
         Ok(())
+    }
+
+    fn relay(&mut self) -> Relay<ReadHalf<'_>, WriteHalf<'_>> {
+        let out_addr = format!(
+            "{}({})",
+            self.target_addr(),
+            self.outbound.as_ref().unwrap().peer_addr().unwrap()
+        );
+
+        let (ri, wi) = self.inbound.split();
+        let (ro, wo) = self.outbound.as_mut().unwrap().split();
+        Relay::new(
+            Channel::new(ri, self.peer_addr.to_string(), wo, out_addr.clone()),
+            Channel::new(ro, out_addr, wi, self.peer_addr.to_string()),
+        )
     }
 
     fn target_addr(&self) -> &str {
@@ -232,6 +167,7 @@ async fn random_wait_on_fail<R, E>(f: impl Future<Output = Result<R, E>>) -> Res
 
     if let Err(_) = &r {
         let millis = UNIFORM.sample(&mut rand::thread_rng());
+        debug!("delay error for {} ms", millis);
         delay_for(Duration::from_millis(millis)).await;
     }
     r

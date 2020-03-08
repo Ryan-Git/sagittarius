@@ -2,15 +2,14 @@ use std::env;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use async_std::io::{BufReader, ReadExt};
+use async_std::io::prelude::*;
 use async_std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use async_std::prelude::*;
 use async_std::task;
 use log::{debug, error, info, trace};
 use once_cell::sync::OnceCell;
 
 use anyhow::anyhow;
-use sagittarius::DEFAULT_SERVER_ADDR;
+use sagittarius::{Channel, Relay, DEFAULT_SERVER_ADDR};
 
 static PORT: OnceCell<u16> = OnceCell::new();
 static REMOTE: OnceCell<String> = OnceCell::new();
@@ -82,8 +81,8 @@ impl Session {
     async fn run(&mut self) -> Result<(), anyhow::Error> {
         self.method_selection().await?;
         self.socks().await?;
-        self.relay().await?;
-        Ok(())
+        self.address().await?;
+        self.relay().await
     }
 
     async fn method_selection(&mut self) -> Result<(), anyhow::Error> {
@@ -159,7 +158,7 @@ impl Session {
         Ok(())
     }
 
-    async fn relay(&mut self) -> Result<(), anyhow::Error> {
+    async fn address(&mut self) -> Result<(), anyhow::Error> {
         let remote = match TcpStream::connect(REMOTE.get().unwrap()).await {
             Ok(remote) => {
                 let mut resp = Vec::from(SOCKS_RESP_PREFIX.as_ref());
@@ -200,35 +199,31 @@ impl Session {
         trace!("size: {}, header: {:?}", size, &header);
         self.outbound_mut().write_all(&header).await?;
 
-        let addr = format!("{}:{}", self.normalized_host(), self.normalized_port());
-        let mut ri = BufReader::new(self.inbound.clone());
-        let mut wi = self.inbound.clone();
-        let mut ro = BufReader::new(self.outbound.as_ref().unwrap().clone());
-        let mut wo = self.outbound.as_ref().unwrap().clone();
-
-        use async_std::io::copy;
-        let i2o = copy(&mut ri, &mut wo);
-        let o2i = copy(&mut ro, &mut wi);
-
         debug!(
-            "relay {} <-> {} established",
+            "relay {} <-> {}:{} established",
             self.outbound_local_addr(),
-            &addr
+            self.normalized_host(),
+            self.normalized_port()
         );
 
-        match i2o.race(o2i).await {
-            Ok(c) => debug!(
-                "relay {} <-> {} copied {} bytes",
-                self.outbound_local_addr(),
-                &addr,
-                c
-            ),
-            Err(e) => {
-                error!("relay {} <-> {} error {:?}", self.peer_addr, &addr, e);
-            }
-        }
-
         Ok(())
+    }
+
+    fn relay(&mut self) -> Relay<TcpStream, TcpStream> {
+        let inbound_addr = format!(
+            "browser({}:{})",
+            self.normalized_host(),
+            self.normalized_port()
+        );
+        let outbound_addr = format!("server({})", self.outbound_local_addr());
+        let ri = self.inbound.clone();
+        let wi = self.inbound.clone();
+        let ro = self.outbound.as_ref().unwrap().clone();
+        let wo = self.outbound.as_ref().unwrap().clone();
+        Relay::new(
+            Channel::new(ri, inbound_addr.clone(), wo, outbound_addr.clone()),
+            Channel::new(ro, outbound_addr, wi, inbound_addr),
+        )
     }
 
     fn normalized_host(&self) -> &str {
